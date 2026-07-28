@@ -29,8 +29,8 @@ class MqttService:
     self.client.on_message = self._on_message
     self.client.on_disconnect = self._on_disconnect
 
-    if self.password:
-      self.client.username_pw_set('', self.password)
+    if self.username and self.password:
+      self.client.username_pw_set(self.username, self.password)
 
     self._running = False
 

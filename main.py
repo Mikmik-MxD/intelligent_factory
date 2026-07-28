@@ -1,4 +1,5 @@
 import time
+import asyncio
 import logging
 import uvicorn
 from contextlib import asynccontextmanager
@@ -10,6 +11,8 @@ from fastapi.exceptions import RequestValidationError
 
 from utils.api_feedBack import error_feedback
 from service.mqtt_service import MqttService
+from service.websocket_service import WebSocketService
+from router.websocket_router import router as ws_router
 
 load_dotenv()
 
@@ -23,18 +26,29 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-  # ===== 启动：创建服务实例并注入到 app.state =====
+  # ===== 启动 =====
+
+  # 1. 创建 WebSocket 服务（必须在 asyncio 线程中拿 loop）
+  loop = asyncio.get_running_loop()
+  ws_service = WebSocketService(loop)
+  app.state.ws_service = ws_service
+
+  # 2. 创建 MQTT 服务
   mqtt_service = MqttService()
-  # 将mqtt示例放入到app.state中
   app.state.mqtt_service = mqtt_service
-  
-  mqtt_service.start() 
+
+  # 3. 把 WebSocket 推送注册为 MQTT 的消息处理器
+  mqtt_service.add_message_handler(ws_service.on_mqtt_message)
+
+  # 4. 启动 MQTT
+  mqtt_service.start()
   logger.info("[APP] 所有服务已启动")
 
   yield
 
   # ===== 关闭 =====
-  mqtt_service.stop() 
+  mqtt_service.stop()
+  await ws_service.close_all()
   logger.info("[APP] 所有服务已停止")
 
 
@@ -54,6 +68,9 @@ app.add_middleware(
   allow_methods=["*"],
   allow_headers=["*"],
 )
+
+# 注册 WebSocket 路由
+app.include_router(ws_router)
 
 
 # 全局参数校验

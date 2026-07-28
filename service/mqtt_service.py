@@ -2,22 +2,23 @@ import os
 import json
 import logging
 from typing import Callable
+from datetime import datetime
 import paho.mqtt.client as mqtt
 
 logger = logging.getLogger(__name__)
 
 
 class MqttService:
-  """基础 MQTT 服务：连接、订阅/取消、发布、消息回调"""
+  """基础 MQTT 服务：连接、订阅/取消、发布、消息回调 + 自动 ACK"""
 
   def __init__(self):
     # 从环境变量读取配置
     self.host = os.getenv("MQTT_BROKER_HOST", "localhost")
     self.port = int(os.getenv("MQTT_BROKER_PORT", 1883))
-    self.username = os.getenv("MQTT_USERNAME") or None
-    self.password = os.getenv("MQTT_PASSWORD") or None
-    self.client_id = os.getenv("MQTT_CLIENT_ID", "mqtt-backend")
-    topics = os.getenv("MQTT_SUB_TOPICS", "device/data/+")
+    self.username = os.getenv("MQTT_USERNAME", "mqtt_server") or None
+    self.password = os.getenv("MQTT_PASSWORD", "zhgc_mqtt_connection") or None
+    self.client_id = os.getenv("MQTT_CLIENT_ID", "mqtt_server")
+    topics = os.getenv("MQTT_SUB_TOPICS", "device/postData_mqtt/+")
     self.sub_topics = [t.strip() for t in topics.split(",") if t.strip()]
 
     # 创建 MQTT 
@@ -28,8 +29,8 @@ class MqttService:
     self.client.on_message = self._on_message
     self.client.on_disconnect = self._on_disconnect
 
-    if self.username and self.password:
-      self.client.username_pw_set(self.username, self.password)
+    if self.password:
+      self.client.username_pw_set('', self.password)
 
     self._running = False
 
@@ -123,15 +124,85 @@ class MqttService:
       raw = msg.payload.decode("utf-8")
       try:
         data = json.loads(raw)
-        logger.info(f"收到消息 [{msg.topic}]: {data}")
       except json.JSONDecodeError:
         data = {"raw": raw}
-      logger.debug(f"收到消息 [{msg.topic}]: {raw[:200]}")
-      # 分发给所有注册的处理器
+
+      logger.info(f"收到消息 [{msg.topic}]: {raw[:200]}")
+
+      # ----- 自动 ACK 回复（仅限 device/postData_mqtt/+ 主题） -----
+      self._auto_ack(msg.topic, data)
+
+      # 分发给所有注册的外部处理器
       for handler in self.message_handlers:
         try:
           handler(msg.topic, data)
         except Exception as e:
           logger.error(f"消息处理器异常: {e}")
+
     except Exception as e:
-      logger.error(f"消息处理异常: {e}")
+        logger.error(f"消息处理异常: {e}")
+
+  # ---------- ACK 逻辑 ----------
+  def _auto_ack(self, topic: str, data: dict):
+    """验证消息并回复 ACK"""
+    # 仅处理以 'device/postData_mqtt/' 开头的主题
+    if not topic.startswith("device/postData_mqtt/"):
+      return
+
+    # 提取设备 ID（例如 'device/postData_mqtt/sensor01' → 'sensor01'）
+    device_id = topic[len("device/postData_mqtt/"):]
+    if not device_id:
+      logger.warning(f"无法从主题提取设备 ID: {topic}")
+      return
+
+    ack_topic = f"device/ack/{device_id}"
+
+    # 生成当前时间戳（14 位数字，如 '20260725183045'）
+    now_ts = datetime.now().strftime("%Y%m%d%H%M%S")
+
+    # 验证数据格式
+    code, message = self._validate_payload(data)
+
+    ack_payload = {
+      "code": code,
+      "message": message,
+      "timestamp": now_ts
+    }
+
+    # 发送 ACK
+    self.client.publish(ack_topic, json.dumps(ack_payload), qos=1)
+    if code == "200":
+      logger.debug(f"已回复 ACK 成功 → {ack_topic}")
+    else:
+      logger.warning(f"已回复 ACK 失败 [{code}] → {ack_topic}: {message}")
+
+  def _validate_payload(self, data: dict) -> tuple[str, str]:
+    """验证传感器数据格式，返回 (code, message)"""
+    # 必须字段检查
+    required_fields = ["type", "data", "unit", "timestamp"]
+    for field in required_fields:
+      if field not in data:
+        return "400", f"缺少必要字段: {field}"
+
+    # 检查 type 和 unit 是否为字符串（允许空串）
+    if not isinstance(data["type"], str) or not isinstance(data["unit"], str):
+      return "400", "字段 'type' 和 'unit' 必须为字符串"
+
+    # 检查 data 是否为数字或数字字符串
+    raw_data = data["data"]
+    if isinstance(raw_data, (int, float)):
+      pass  # 数字直接通过
+    elif isinstance(raw_data, str):
+      try:
+        float(raw_data)  # 尝试转换为数字
+      except ValueError:
+        return "400", "字段 'data' 必须为数字或数字字符串"
+    else:
+      return "400", "字段 'data' 类型不正确"
+
+    # 检查 timestamp 格式（14 位数字）
+    ts = data["timestamp"]
+    if not isinstance(ts, str) or not ts.isdigit() or len(ts) != 14:
+      return "400", "字段 'timestamp' 必须为 14 位数字字符串 (如 20260720175940)"
+
+    return "200", "发送成功"
